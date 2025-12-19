@@ -1,0 +1,308 @@
+#!/bin/bash
+
+# --- 0. Pre-flight check ---
+# Ensure this script is NOT run as root/sudo
+if [ "$EUID" -eq 0 ]; then
+    echo "Error: Please run this script as your normal user (without sudo)."
+    echo "The script needs to detect your username to configure the file paths."
+    echo "It will ask for your password when it needs permissions."
+    exit 1
+fi
+
+# Capture the current username
+INSTALL_USER="$USER"
+echo "Installing for user: $INSTALL_USER"
+
+# --- 1. Check for dualsensectl ---
+echo "Checking for dualsensectl..."
+if ! command -v dualsensectl &> /dev/null; then
+    echo "Error: dualsensectl is not installed or not in your PATH."
+    echo "Please install it first (e.g., yay -S dualsensectl-git)."
+    exit 1
+fi
+
+# Get the absolute path to the executable
+DS_CTL_PATH=$(command -v dualsensectl)
+echo "Found dualsensectl at: $DS_CTL_PATH"
+
+# --- 2. Create ds-tense script ---
+echo "Installing ds-tense to /usr/local/bin/..."
+
+# We use 'EOF' (quoted) to prevent variables inside the script from expanding now.
+# They will only expand when the ds-tense script is actually run later.
+sudo tee /usr/local/bin/ds-tense > /dev/null <<'EOF'
+#!/bin/bash
+
+# Configuration
+REAL_USER="__USER_PLACEHOLDER__" 
+CONFIG_FILE="/home/$REAL_USER/.config/ds-tense.conf"
+DEFAULT_SETTINGS="reconnect_mode=default
+last_setting=default
+default=0 0 0 0 4 5 1 1 1 0"
+
+export PATH=$PATH:/usr/local/bin
+
+# Ensure config file exists with default settings
+ensure_config_exists() {
+    if [ ! -f "$CONFIG_FILE" ]; then
+        mkdir -p "$(dirname "$CONFIG_FILE")"
+        echo "$DEFAULT_SETTINGS" > "$CONFIG_FILE"
+    fi
+}
+
+# Get setting from config file
+get_setting() {
+    local name="$1"
+    grep -E "^${name}=" "$CONFIG_FILE" 2>/dev/null | cut -d '=' -f2-
+}
+
+# Validate and format settings
+validate_settings() {
+    local input_string="$1"
+    # Matches 10 digits (0-8), optionally separated by spaces or commas
+    local regex="^(([0-8])[ ,]{0,2}){9}([0-8])$"
+
+    if [[ $input_string =~ $regex ]]; then
+        # 1. echo the string
+        # 2. grep -o "[0-8]" : Extracts ONLY the digits, putting each on a new line
+        # 3. paste -sd ' ' - : Joins the lines back together with a single space
+        echo "$input_string" | grep -o "[0-8]" | paste -sd ' ' -
+        return 0
+    else
+        return 1
+    fi
+}
+
+# Add or update a setting in config file
+create_setting() {
+    local name="$1"
+    local raw_value="$2"
+    
+    # Validate and format the settings
+    local value
+    if ! value=$(validate_settings "$raw_value"); then
+        return 1
+    fi
+    
+    if grep -q "^${name}=" "$CONFIG_FILE"; then
+        # Update existing setting
+        sed -i "s/^${name}=.*/${name}=${value}/" "$CONFIG_FILE"
+    else
+        # Add new setting
+        echo "${name}=${value}" >> "$CONFIG_FILE"
+    fi
+}
+
+# Apply trigger settings
+apply_settings() {
+    local settings="$1"
+    echo "Applying settings: $settings"
+    dualsensectl trigger both feedback-raw $settings
+}
+
+
+# Show usage information
+show_usage() {
+    local cmd_name=$(basename "$0")
+
+    echo "Usage:"
+    echo "  $cmd_name create <name> <settings>      - Save a new configuration"
+    echo "  $cmd_name load <name> <settings>        - Load a saved configuration"
+    echo "  $cmd_name set <settings>                - Apply the given settings"
+    echo "  $cmd_name reconnect <last|default|none> - Automatically load the last, default, or no setting when reconnecting the controller."
+    echo "  $cmd_name uninstall                     - Uninstall the DualSense fix and all system rules"
+    echo ""
+    echo "Settings should be 10 digits (0-8)"
+    echo "Example: $cmd_name create custom 0000451110"
+    echo "         $cmd_name load custom"
+    echo "         $cmd_name set 0000451110"
+}
+
+# Main script
+ensure_config_exists
+
+if [ $# -lt 1 ]; then
+    show_usage
+    exit 1
+fi
+
+uninstall() {
+    # 1. Main Confirmation
+    read -p "Are you sure you want to uninstall the DualSense fix script? (y/N): " confirm
+    if [[ ! "$confirm" =~ ^[Yy]$ ]]; then
+        echo "Uninstallation cancelled."
+        return 0
+    fi
+
+    # 2. Config File Confirmation
+    local remove_config="n"
+    
+    if [[ -f "$CONFIG_FILE" ]]; then
+        read -p "Do you also want to delete your configuration file at $CONFIG_FILE? (y/N): " config_confirm
+        if [[ "$config_confirm" =~ ^[Yy]$ ]]; then
+            remove_config="y"
+        fi
+    fi
+
+    echo "Starting uninstallation..."
+
+    # 3. Remove User Configuration (if confirmed)
+    if [[ "$remove_config" == "y" ]]; then
+        rm "$CONFIG_FILE"
+        echo "Removed configuration file: $CONFIG_FILE"
+    else
+        echo "Skipped configuration file removal."
+    fi
+
+    # 4. Removing device rules
+    sudo rm /etc/udev/rules.d/99-dualsense-tense.rules
+    echo "Removed device rules."
+
+    # 5. Reload udev Rules
+    sudo udevadm control --reload-rules && sudo udevadm trigger
+    echo "Reloaded device rules."
+
+    # 6. Self-Destruct
+    local script_path="${BASH_SOURCE[0]}"
+    if [[ -f "$script_path" ]]; then
+        echo "Removing script file: $script_path"
+        sudo rm -- "$script_path"
+    else
+        echo "Warning: Could not determine script path for deletion."
+    fi
+
+    echo "Uninstallation complete."
+}
+
+case "$1" in
+    reconnect)
+        ensure_config_exists
+        case "$2" in
+            last|default|none)
+                if grep -q "^reconnect_mode=" "$CONFIG_FILE"; then
+                    # Update existing setting
+                    sed -i "s/^reconnect_mode=.*/reconnect_mode=$2/" "$CONFIG_FILE"
+                else
+                    # Add new setting
+                    echo "reconnect_mode=$2" >> "$CONFIG_FILE"
+                fi
+                exit 0
+                ;;
+            *)
+                # Do nothing if $2 is missing or invalid; 
+                # the script will proceed with the existing stored setting.
+                ;;
+        esac
+        mode=$(get_setting "reconnect_mode")
+        case "$mode" in
+            last)
+                last=$(get_setting "last_setting")
+                settings=$(get_setting "$last")
+                [[ -n "$settings" ]] && apply_settings "$settings"
+                ;;
+            none)
+                exit 0
+                ;;
+            default|*)
+                settings=$(get_setting "default")
+                apply_settings "$settings"
+                ;;
+        esac
+        ;;
+    create)
+        if [ $# -lt 3 ]; then
+            echo "Error: Missing arguments for create mode"
+            show_usage
+            exit 1
+        fi
+        ensure_config_exists
+        name="$2"
+        # Combine all remaining arguments into one string
+        shift 2
+        settings="$*"
+        if ! create_setting "$name" "$settings"; then
+            show_usage
+            exit 1
+        fi
+        echo "Saved configuration '$name': $(get_setting "$name")"
+        ;;
+    load)
+        ensure_config_exists
+        name="${2:-default}"
+        settings=$(get_setting "$name")
+        
+        if [ -z "$settings" ]; then
+            echo "Warning: Configuration '$name' not found, using default"
+            settings=$(get_setting "default")
+        fi
+        
+        apply_settings "$settings"
+
+        if grep -q "^last_setting=" "$CONFIG_FILE"; then
+            # Update existing setting
+            sed -i "s/^last_setting=.*/last_setting=${name}/" "$CONFIG_FILE"
+        else
+            # Add new setting
+            echo "last_setting=${name}" >> "$CONFIG_FILE"
+        fi
+        ;;
+    set)
+        if [ $# -lt 2 ]; then
+            echo "Error: Missing arguments for set mode"
+            show_usage
+            exit 1
+        fi
+
+        shift 1
+        settings="$*"
+
+        value=""
+        if ! value=$(validate_settings "$settings"); then
+            show_usage
+            exit 1
+        fi
+
+        if ! apply_settings "$value"; then
+            show_usage
+            exit 1
+        fi
+        ;;
+    uninstall)
+        uninstall
+        ;;
+    *)
+        echo "Error: Unknown command '$1'"
+        show_usage
+        exit 1
+        ;;
+esac
+
+exit 0
+EOF
+
+# --- 3. Inject username into installed script ---
+sudo sed -i "s/__USER_PLACEHOLDER__/$INSTALL_USER/g" /usr/local/bin/ds-tense
+
+# --- 4. Make script executable ---
+sudo chmod +x /usr/local/bin/ds-tense
+echo "Made /usr/local/bin/ds-tense executable."
+
+# --- 5. Create udev rule ---
+sudo tee /etc/udev/rules.d/99-dualsense-tense.rules > /dev/null <<'EOF'
+ACTION=="add", SUBSYSTEM=="usb", ATTRS{idVendor}=="054c", ATTRS{idProduct}=="0ce6", RUN+="/usr/local/bin/ds-tense reconnect"
+ACTION=="add", SUBSYSTEM=="usb", ATTRS{idVendor}=="054c", ATTRS{idProduct}=="0df2", RUN+="/usr/local/bin/ds-tense reconnect"
+EOF
+echo "Created udev rule for DualSense."
+
+# --- 6. Initialize controller ---
+echo "Initializing controller with default settings"
+ds-tense load
+
+# --- 7. Reload udev rules ---
+sudo udevadm control --reload-rules && sudo udevadm trigger
+echo "Reloaded udev rules."
+
+echo "----------------------------------------------------"
+echo "Installation Complete!"
+echo "Try running: ds-tense load default"
+echo "----------------------------------------------------"
